@@ -1,0 +1,1366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>像素机甲大战 - Pixel Mecha Battle</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a0a0a;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  overflow: hidden;
+  font-family: 'Courier New', monospace;
+  user-select: none;
+}
+#game-container {
+  position: relative;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+canvas {
+  display: block;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  border: 3px solid #333;
+  box-shadow: 0 0 30px rgba(0,150,255,0.3), 0 0 60px rgba(255,50,0,0.2);
+}
+</style>
+</head>
+<body>
+<div id="game-container">
+  <canvas id="game"></canvas>
+</div>
+
+<script>
+// ============================================================
+//  PIXEL MECHA BATTLE - 像素机甲大战
+// ============================================================
+
+const INTERNAL_W = 640;
+const INTERNAL_H = 360;
+
+// DOM
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// Offscreen canvas for pixel-art rendering
+const offscreen = document.createElement('canvas');
+offscreen.width = INTERNAL_W;
+offscreen.height = INTERNAL_H;
+const offCtx = offscreen.getContext('2d');
+offCtx.imageSmoothingEnabled = false;
+
+// Scale canvas to fit window
+function resizeCanvas() {
+  const scale = Math.min(
+    Math.floor(window.innerWidth / INTERNAL_W),
+    Math.floor(window.innerHeight / INTERNAL_H)
+  );
+  canvas.width = INTERNAL_W * scale;
+  canvas.height = INTERNAL_H * scale;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ============================================================
+//  CONSTANTS
+// ============================================================
+const GROUND_Y = 300;
+const GRAVITY = 0.55;
+const MAX_FALL_SPEED = 12;
+
+const STATE = {
+  TITLE: 'title',
+  PLAYING: 'playing',
+  ROUND_END: 'round_end',
+  GAME_OVER: 'game_over'
+};
+
+const ATTACK_TYPE = {
+  MELEE: 'melee',
+  RANGED: 'ranged',
+  SPECIAL: 'special'
+};
+
+// ============================================================
+//  AUDIO SYSTEM (8-bit style sound effects)
+// ============================================================
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+}
+
+function playBeep(freq, duration, type='square', vol=0.08) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function playSfx(name) {
+  initAudio();
+  switch(name) {
+    case 'melee':
+      playBeep(120, 0.08, 'square', 0.1);
+      playBeep(80, 0.06, 'sawtooth', 0.06);
+      break;
+    case 'ranged':
+      playBeep(600, 0.05, 'square', 0.05);
+      setTimeout(() => playBeep(800, 0.04, 'square', 0.04), 50);
+      break;
+    case 'special':
+      playBeep(200, 0.15, 'sawtooth', 0.10);
+      setTimeout(() => playBeep(100, 0.2, 'sawtooth', 0.08), 80);
+      setTimeout(() => playBeep(60, 0.3, 'triangle', 0.10), 160);
+      break;
+    case 'block':
+      playBeep(300, 0.06, 'triangle', 0.06);
+      playBeep(450, 0.04, 'triangle', 0.04);
+      break;
+    case 'hit':
+      playBeep(60, 0.12, 'sawtooth', 0.15);
+      playBeep(40, 0.08, 'square', 0.10);
+      break;
+    case 'round_win':
+      playBeep(523, 0.1, 'square', 0.08);
+      setTimeout(() => playBeep(659, 0.1, 'square', 0.08), 100);
+      setTimeout(() => playBeep(784, 0.2, 'square', 0.08), 200);
+      break;
+    case 'game_over':
+      playBeep(392, 0.15, 'square', 0.08);
+      setTimeout(() => playBeep(330, 0.15, 'square', 0.08), 150);
+      setTimeout(() => playBeep(262, 0.3, 'square', 0.08), 300);
+      setTimeout(() => playBeep(523, 0.4, 'square', 0.10), 600);
+      break;
+    case 'start':
+      playBeep(440, 0.08, 'square', 0.06);
+      setTimeout(() => playBeep(554, 0.08, 'square', 0.06), 100);
+      setTimeout(() => playBeep(660, 0.12, 'square', 0.06), 200);
+      break;
+  }
+}
+
+// ============================================================
+//  PARTICLE SYSTEM
+// ============================================================
+class Particle {
+  constructor(x, y, vx, vy, color, life, size=2) {
+    this.x = x;
+    this.y = y;
+    this.vx = vx;
+    this.vy = vy;
+    this.color = color;
+    this.life = life;
+    this.maxLife = life;
+    this.size = size;
+  }
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vy += 0.1;
+    this.life--;
+    return this.life > 0;
+  }
+  draw(ctx) {
+    const alpha = this.life / this.maxLife;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = this.color;
+    const s = Math.floor(this.size * alpha + 1);
+    ctx.fillRect(Math.floor(this.x), Math.floor(this.y), s, s);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ============================================================
+//  PROJECTILE
+// ============================================================
+class Projectile {
+  constructor(x, y, vx, vy, damage, owner, color, type='normal') {
+    this.x = x;
+    this.y = y;
+    this.vx = vx;
+    this.vy = vy;
+    this.damage = damage;
+    this.owner = owner; // reference to the Mecha that fired it
+    this.color = color;
+    this.type = type;
+    this.alive = true;
+    this.width = type === 'special' ? 8 : 4;
+    this.height = type === 'special' ? 8 : 4;
+    this.trail = [];
+  }
+  update() {
+    this.trail.push({x: Math.floor(this.x), y: Math.floor(this.y), life: 3});
+    this.trail = this.trail.filter(t => { t.life--; return t.life > 0; });
+    this.x += this.vx;
+    this.y += this.vy;
+    if (this.x < -20 || this.x > INTERNAL_W + 20 || this.y < -20 || this.y > INTERNAL_H + 20) {
+      this.alive = false;
+    }
+  }
+  draw(ctx) {
+    // Trail
+    for (const t of this.trail) {
+      ctx.globalAlpha = t.life / 3 * 0.5;
+      ctx.fillStyle = this.color;
+      ctx.fillRect(t.x, t.y, this.width, this.height);
+    }
+    ctx.globalAlpha = 1;
+    // Main projectile
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(Math.floor(this.x), Math.floor(this.y), this.width, this.height);
+    ctx.fillStyle = this.color;
+    ctx.fillRect(Math.floor(this.x)+1, Math.floor(this.y)+1, this.width-2, this.height-2);
+    if (this.type === 'special') {
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(Math.floor(this.x)+2, Math.floor(this.y)-1, 4, 2);
+      ctx.fillRect(Math.floor(this.x)+2, Math.floor(this.y)+this.height-1, 4, 2);
+    }
+  }
+  getHitbox() {
+    return {
+      x: Math.floor(this.x),
+      y: Math.floor(this.y),
+      w: this.width,
+      h: this.height
+    };
+  }
+}
+
+// ============================================================
+//  INPUT HANDLER
+// ============================================================
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  e.preventDefault();
+});
+window.addEventListener('keyup', e => {
+  keys[e.code] = false;
+  e.preventDefault();
+});
+
+// ============================================================
+//  MECHA CLASS
+// ============================================================
+class Mecha {
+  constructor(x, y, facingRight, config) {
+    this.x = x;
+    this.y = y;
+    this.vx = 0;
+    this.vy = 0;
+    this.facingRight = facingRight;
+    this.width = config.width || 32;
+    this.height = config.height || 48;
+    this.config = config;
+    
+    // Stats
+    this.maxHp = config.maxHp || 100;
+    this.hp = this.maxHp;
+    this.speed = config.speed || 3;
+    this.meleeDamage = config.meleeDamage || 12;
+    this.rangedDamage = config.rangedDamage || 8;
+    this.specialDamage = config.specialDamage || 22;
+    
+    // Energy
+    this.maxEnergy = 100;
+    this.energy = 100;
+    this.energyRegen = config.energyRegen || 0.4;
+    this.specialCost = 50;
+    
+    // State
+    this.grounded = false;
+    this.shielding = false;
+    this.attacking = false;
+    this.attackTimer = 0;
+    this.attackType = null;
+    this.stunTimer = 0;
+    this.hitFlash = 0;
+    
+    // Cooldowns
+    this.meleeCooldown = 0;
+    this.rangedCooldown = 0;
+    this.specialCooldown = 0;
+    this.meleeCdMax = config.meleeCdMax || 18; // frames
+    this.rangedCdMax = config.rangedCdMax || 35;
+    this.specialCdMax = config.specialCdMax || 90;
+    
+    // Animation
+    this.animFrame = 0;
+    this.animTimer = 0;
+    this.walkCycle = 0;
+    
+    // Combo
+    this.combo = 0;
+    this.comboTimer = 0;
+  }
+  
+  reset(x) {
+    this.hp = this.maxHp;
+    this.energy = 100;
+    this.x = x;
+    this.y = GROUND_Y - this.height;
+    this.vx = 0;
+    this.vy = 0;
+    this.shielding = false;
+    this.attacking = false;
+    this.attackTimer = 0;
+    this.stunTimer = 0;
+    this.hitFlash = 0;
+    this.meleeCooldown = 0;
+    this.rangedCooldown = 0;
+    this.specialCooldown = 0;
+    this.combo = 0;
+    this.comboTimer = 0;
+  }
+  
+  update(input, opponent, particles, projectiles) {
+    // Timers
+    if (this.meleeCooldown > 0) this.meleeCooldown--;
+    if (this.rangedCooldown > 0) this.rangedCooldown--;
+    if (this.specialCooldown > 0) this.specialCooldown--;
+    if (this.stunTimer > 0) { this.stunTimer--; return; }
+    if (this.hitFlash > 0) this.hitFlash--;
+    if (this.attackTimer > 0) {
+      this.attackTimer--;
+      if (this.attackTimer === 0) {
+        this.attacking = false;
+        this.attackType = null;
+      }
+    }
+    if (this.comboTimer > 0) {
+      this.comboTimer--;
+      if (this.comboTimer === 0) this.combo = 0;
+    }
+    
+    // Energy regen
+    if (this.energy < this.maxEnergy) {
+      this.energy += this.energyRegen;
+      if (this.energy > this.maxEnergy) this.energy = this.maxEnergy;
+    }
+    
+    // Movement (if not shielding - shield slows movement)
+    const speedMul = this.shielding ? 0.4 : 1.0;
+    this.vx = 0;
+    if (!this.attacking) {
+      if (input.left) this.vx = -this.speed * speedMul;
+      if (input.right) this.vx = this.speed * speedMul;
+      if (input.left && input.right) this.vx = 0;
+    }
+    
+    // Jump
+    if (input.jump && this.grounded && !this.attacking) {
+      this.vy = -9;
+      this.grounded = false;
+    }
+    
+    // Gravity
+    if (!this.grounded) {
+      this.vy += GRAVITY;
+      if (this.vy > MAX_FALL_SPEED) this.vy = MAX_FALL_SPEED;
+    }
+    
+    // Apply velocity
+    this.x += this.vx;
+    this.y += this.vy;
+    
+    // Ground collision
+    if (this.y + this.height >= GROUND_Y) {
+      this.y = GROUND_Y - this.height;
+      this.vy = 0;
+      this.grounded = true;
+    }
+    
+    // Wall collision
+    if (this.x < 10) this.x = 10;
+    if (this.x + this.width > INTERNAL_W - 10) this.x = INTERNAL_W - 10 - this.width;
+    if (this.y < 0) { this.y = 0; this.vy = 0; }
+    
+    // Facing
+    if (this.vx > 0) this.facingRight = true;
+    if (this.vx < 0) this.facingRight = false;
+    
+    // Shield
+    this.shielding = input.shield && !this.attacking && this.grounded;
+    
+    // Walk animation
+    if (Math.abs(this.vx) > 0 && this.grounded) {
+      this.animTimer++;
+      if (this.animTimer > 6) { this.animTimer = 0; this.walkCycle = (this.walkCycle + 1) % 4; }
+    } else {
+      this.walkCycle = 0;
+    }
+    
+    // Attacks
+    if (!this.attacking && !this.shielding && this.stunTimer === 0) {
+      if (input.melee && this.meleeCooldown === 0) {
+        this.doMeleeAttack(opponent, particles);
+      } else if (input.ranged && this.rangedCooldown === 0) {
+        this.doRangedAttack(projectiles);
+      } else if (input.special && this.specialCooldown === 0 && this.energy >= this.specialCost) {
+        this.doSpecialAttack(projectiles);
+      }
+    }
+  }
+  
+  doMeleeAttack(opponent, particles) {
+    this.attacking = true;
+    this.attackType = ATTACK_TYPE.MELEE;
+    this.attackTimer = 10;
+    this.meleeCooldown = this.meleeCdMax;
+    
+    playSfx('melee');
+    
+    // Check if opponent is in melee range
+    const atkX = this.facingRight ? this.x + this.width : this.x - 20;
+    const atkRange = 30;
+    const opCenterX = opponent.x + opponent.width / 2;
+    const opCenterY = opponent.y + opponent.height / 2;
+    const myCenterX = atkX + 10;
+    const myCenterY = this.y + this.height / 2;
+    
+    const distX = Math.abs(myCenterX - opCenterX);
+    const distY = Math.abs(myCenterY - opCenterY);
+    
+    if (distX < atkRange && distY < 50) {
+      let dmg = this.meleeDamage + this.combo * 2;
+      opponent.takeDamage(dmg, this);
+      
+      // Spawn particles at impact
+      const impactX = opponent.x + opponent.width / 2;
+      const impactY = opponent.y + opponent.height / 2;
+      for (let i = 0; i < 8; i++) {
+        particles.push(new Particle(
+          impactX, impactY,
+          (Math.random() - 0.5) * 6,
+          (Math.random() - 0.5) * 6 - 2,
+          '#fff', 12, 3
+        ));
+      }
+      for (let i = 0; i < 6; i++) {
+        particles.push(new Particle(
+          impactX, impactY,
+          (Math.random() - 0.5) * 4,
+          (Math.random() - 0.5) * 4 - 1,
+          this.config.particleColor, 15, 2
+        ));
+      }
+    } else {
+      // Whiff particles
+      const whiffX = atkX + 10;
+      const whiffY = this.y + this.height / 2;
+      for (let i = 0; i < 4; i++) {
+        particles.push(new Particle(
+          whiffX, whiffY,
+          (Math.random() - 0.5) * 3,
+          (Math.random() - 0.5) * 3,
+          '#888', 8, 1
+        ));
+      }
+    }
+  }
+  
+  doRangedAttack(projectiles) {
+    this.attacking = true;
+    this.attackType = ATTACK_TYPE.RANGED;
+    this.attackTimer = 8;
+    this.rangedCooldown = this.rangedCdMax;
+    
+    playSfx('ranged');
+    
+    const dir = this.facingRight ? 1 : -1;
+    const spawnX = this.facingRight ? this.x + this.width : this.x - 4;
+    const spawnY = this.y + this.height * 0.35;
+    
+    projectiles.push(new Projectile(
+      spawnX, spawnY, dir * 5, 0,
+      this.rangedDamage, this,
+      this.config.projectileColor, 'normal'
+    ));
+  }
+  
+  doSpecialAttack(projectiles) {
+    this.attacking = true;
+    this.attackType = ATTACK_TYPE.SPECIAL;
+    this.attackTimer = 15;
+    this.specialCooldown = this.specialCdMax;
+    this.energy -= this.specialCost;
+    
+    playSfx('special');
+    
+    const dir = this.facingRight ? 1 : -1;
+    const spawnX = this.facingRight ? this.x + this.width : this.x - 8;
+    const spawnY = this.y + this.height * 0.3;
+    
+    projectiles.push(new Projectile(
+      spawnX, spawnY, dir * 3.5, 0,
+      this.specialDamage, this,
+      this.config.specialColor, 'special'
+    ));
+  }
+  
+  takeDamage(damage, attacker) {
+    if (this.stunTimer > 0) return;
+    
+    let finalDmg = damage;
+    if (this.shielding) {
+      finalDmg = Math.floor(damage * 0.25);
+      playSfx('block');
+      // Block particles
+      const cx = this.x + this.width / 2;
+      const cy = this.y + this.height / 2;
+      for (let i = 0; i < 10; i++) {
+        window._gameParticles.push(new Particle(
+          cx + (Math.random() - 0.5) * 20,
+          cy + (Math.random() - 0.5) * 20,
+          (Math.random() - 0.5) * 3,
+          (Math.random() - 0.5) * 3,
+          '#aaccff', 10, 2
+        ));
+      }
+    } else {
+      playSfx('hit');
+    }
+    
+    this.hp -= finalDmg;
+    if (this.hp < 0) this.hp = 0;
+    this.hitFlash = 6;
+    this.stunTimer = finalDmg > 15 ? 15 : 8;
+    
+    // Knockback
+    const kbDir = attacker.x < this.x ? 1 : -1;
+    this.vx = kbDir * (finalDmg * 0.15);
+    this.vy = -finalDmg * 0.2;
+    this.grounded = false;
+  }
+  
+  draw(ctx) {
+    const fx = Math.floor(this.x);
+    const fy = Math.floor(this.y);
+    const dir = this.facingRight ? 1 : -1;
+    const flash = this.hitFlash > 0 && this.hitFlash % 2 === 0;
+    
+    ctx.save();
+    ctx.translate(fx + this.width / 2, fy);
+    
+    // Draw the mecha pixel art
+    this.drawMecha(ctx, dir, flash);
+    
+    ctx.restore();
+    
+    // Shield effect
+    if (this.shielding) {
+      const alpha = 0.3 + Math.sin(Date.now() / 100) * 0.15;
+      ctx.strokeStyle = `rgba(100,180,255,${alpha})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      if (this.facingRight) {
+        ctx.arc(fx + this.width + 4, fy + this.height / 2, 18, -Math.PI/2, Math.PI/2);
+      } else {
+        ctx.arc(fx - 4, fy + this.height / 2, 18, Math.PI/2, -Math.PI/2);
+      }
+      ctx.stroke();
+      
+      // Shield glow
+      ctx.fillStyle = `rgba(100,180,255,${alpha * 0.4})`;
+      if (this.facingRight) {
+        ctx.fillRect(fx + this.width, fy, 16, this.height);
+      } else {
+        ctx.fillRect(fx - 16, fy, 16, this.height);
+      }
+    }
+  }
+  
+  drawMecha(ctx, dir, flash) {
+    const w = this.width;
+    const h = this.height;
+    
+    // Flash on hit
+    if (flash) {
+      ctx.globalAlpha = 0.5;
+    }
+    
+    const c = this.config.colors;
+    
+    // Legs
+    this.drawLegs(ctx, dir, c, w, h);
+    
+    // Body / Torso
+    ctx.fillStyle = c.body;
+    ctx.fillRect(dir * (-w/2 + 8), h * 0.35, w - 16, h * 0.25);
+    // Chest detail
+    ctx.fillStyle = c.bodyLight;
+    ctx.fillRect(dir * (-w/2 + 10), h * 0.37, w - 20, h * 0.15);
+    ctx.fillStyle = c.core;
+    ctx.fillRect(dir * (-w/2 + 12), h * 0.40, 6, 6);
+    
+    // Arms
+    this.drawArms(ctx, dir, c, w, h);
+    
+    // Shoulders
+    ctx.fillStyle = c.shoulder;
+    ctx.fillRect(dir * (-w/2 + 4), h * 0.30, 8, 8);
+    ctx.fillRect(dir * (w/2 - 12), h * 0.30, 8, 8);
+    
+    // Head
+    ctx.fillStyle = c.head;
+    ctx.fillRect(dir * (-w/2 + 8), h * 0.08, w - 16, 10);
+    // Visor
+    ctx.fillStyle = c.visor;
+    ctx.fillRect(dir * (-w/2 + 10), h * 0.10, w - 20, 3);
+    // Eyes glow
+    ctx.fillStyle = '#fff';
+    const eyeX = dir > 0 ? w/2 - 12 : -w/2 + 10;
+    ctx.fillRect(eyeX, h * 0.11, 3, 1);
+    
+    // Antenna / ornament
+    ctx.fillStyle = c.antenna;
+    ctx.fillRect(dir * (-w/2 + 14), h * 0.02, 4, 4);
+    
+    // Thrusters (back)
+    ctx.fillStyle = c.thruster;
+    const thrusterX = dir > 0 ? -w/2 + 10 : w/2 - 14;
+    ctx.fillRect(thrusterX, h * 0.55, 4, 6);
+    // Thruster flame (animated)
+    const flameAlpha = 0.4 + Math.sin(Date.now() / 150 + (dir > 0 ? 0 : 1)) * 0.3;
+    ctx.fillStyle = `rgba(255,200,50,${flameAlpha})`;
+    ctx.fillRect(thrusterX + 1, h * 0.61, 2, 3 + Math.random() * 2);
+  }
+  
+  drawLegs(ctx, dir, c, w, h) {
+    const legOffset = this.walkCycle % 2 === 0 ? 0 : (this.walkCycle === 1 ? 2 : -2);
+    // Left leg
+    ctx.fillStyle = c.leg;
+    ctx.fillRect(dir * (-w/2 + 6), h * 0.58 + legOffset, 6, h * 0.28);
+    ctx.fillStyle = c.legBottom;
+    ctx.fillRect(dir * (-w/2 + 4), h * 0.84 + legOffset, 10, 4);
+    // Right leg
+    ctx.fillStyle = c.leg;
+    ctx.fillRect(dir * (w/2 - 12), h * 0.58 - legOffset, 6, h * 0.28);
+    ctx.fillStyle = c.legBottom;
+    ctx.fillRect(dir * (w/2 - 14), h * 0.84 - legOffset, 10, 4);
+  }
+  
+  drawArms(ctx, dir, c, w, h) {
+    const armY = h * 0.32;
+    // Upper arm (back)
+    ctx.fillStyle = c.armUpper;
+    ctx.fillRect(dir * (w/2 - 10), armY, 6, 12);
+    // Forearm
+    ctx.fillStyle = c.armLower;
+    ctx.fillRect(dir * (w/2 - 10), armY + 12, 6, 10);
+    // Hand / weapon
+    ctx.fillStyle = c.weapon;
+    ctx.fillRect(dir * (w/2 - 12), armY + 20, 10, 6);
+    
+    // Attack arm (front) - extends during attack
+    const atkExtend = this.attacking && this.attackType === ATTACK_TYPE.MELEE ? 8 : 0;
+    ctx.fillStyle = c.armUpper;
+    ctx.fillRect(dir * (-w/2 + 4), armY, 6, 12);
+    ctx.fillStyle = c.armLower;
+    ctx.fillRect(dir * (-w/2 + 4) - (dir > 0 ? atkExtend : -atkExtend), armY + 12, 6 + atkExtend, 10);
+    ctx.fillStyle = c.weapon;
+    const fistX = dir > 0 ? -w/2 + 4 + atkExtend : -w/2 + 4 - atkExtend;
+    ctx.fillRect(fistX, armY + 20, 8, 6);
+  }
+  
+  getHitbox() {
+    return {
+      x: Math.floor(this.x),
+      y: Math.floor(this.y),
+      w: this.width,
+      h: this.height
+    };
+  }
+}
+
+// Mecha configurations — identical stats, different colors
+const BALANCED_STATS = {
+  maxHp: 100,
+  speed: 3.0,
+  meleeDamage: 15,
+  rangedDamage: 10,
+  specialDamage: 25,
+  meleeCdMax: 18,
+  rangedCdMax: 35,
+  specialCdMax: 90,
+  energyRegen: 0.4,
+  width: 34,
+  height: 50
+};
+
+const MECHA_CONFIGS = {
+  striker: {
+    name: '机甲·蓝',
+    nameEn: 'MECHA BLUE',
+    ...BALANCED_STATS,
+    particleColor: '#44ccff',
+    projectileColor: '#44ddff',
+    specialColor: '#00ccff',
+    colors: {
+      head: '#2266aa',
+      visor: '#00ddff',
+      antenna: '#44aadd',
+      body: '#2255aa',
+      bodyLight: '#3377cc',
+      core: '#00eeff',
+      shoulder: '#3366bb',
+      armUpper: '#335599',
+      armLower: '#224488',
+      weapon: '#4499cc',
+      leg: '#224488',
+      legBottom: '#336699',
+      thruster: '#3388bb'
+    }
+  },
+  juggernaut: {
+    name: '机甲·红',
+    nameEn: 'MECHA RED',
+    ...BALANCED_STATS,
+    particleColor: '#ff6644',
+    projectileColor: '#ff4422',
+    specialColor: '#ff2200',
+    colors: {
+      head: '#883322',
+      visor: '#ff3300',
+      antenna: '#aa4433',
+      body: '#772211',
+      bodyLight: '#994433',
+      core: '#ff4400',
+      shoulder: '#993322',
+      armUpper: '#772211',
+      armLower: '#661100',
+      weapon: '#cc4422',
+      leg: '#661100',
+      legBottom: '#883322',
+      thruster: '#994422'
+    }
+  }
+};
+
+// ============================================================
+//  GAME CLASS
+// ============================================================
+class Game {
+  constructor() {
+    this.state = STATE.TITLE;
+    this.particles = [];
+    this.projectiles = [];
+    this.mecha1 = new Mecha(80, GROUND_Y - 50, true, MECHA_CONFIGS.striker);
+    this.mecha2 = new Mecha(INTERNAL_W - 114, GROUND_Y - 50, false, MECHA_CONFIGS.juggernaut);
+    this.scores = [0, 0];
+    this.round = 0;
+    this.roundTimer = 0;
+    this.roundMaxTime = 99 * 60; // 99 seconds in frames
+    this.roundEndDelay = 0;
+    this.screenShake = 0;
+    this.titleFlash = 0;
+    this.bgStars = [];
+    
+    // Generate background stars
+    for (let i = 0; i < 60; i++) {
+      this.bgStars.push({
+        x: Math.random() * INTERNAL_W,
+        y: Math.random() * (GROUND_Y - 40),
+        size: Math.floor(Math.random() * 2) + 1,
+        twinkle: Math.random() * Math.PI * 2
+      });
+    }
+    
+    // Expose particles for mecha access
+    window._gameParticles = this.particles;
+  }
+  
+  startRound() {
+    this.mecha1.reset(80);
+    this.mecha2.reset(INTERNAL_W - 114);
+    this.particles = [];
+    this.projectiles = [];
+    window._gameParticles = this.particles;
+    this.roundTimer = this.roundMaxTime;
+    this.roundEndDelay = 0;
+    this.screenShake = 0;
+    this.state = STATE.PLAYING;
+    playSfx('start');
+  }
+  
+  update() {
+    this.titleFlash++;
+    
+    if (this.state !== STATE.PLAYING) return;
+    
+    // Screen shake decay
+    if (this.screenShake > 0) this.screenShake *= 0.85;
+    if (this.screenShake < 0.3) this.screenShake = 0;
+    
+    // Round timer
+    if (this.roundTimer > 0) {
+      this.roundTimer--;
+      if (this.roundTimer <= 0) {
+        this.endRound();
+      }
+    }
+    
+    // Process inputs
+    const input1 = {
+      left: keys['KeyA'],
+      right: keys['KeyD'],
+      jump: keys['KeyW'],
+      shield: keys['KeyI'],
+      melee: keys['KeyJ'],
+      ranged: keys['KeyK'],
+      special: keys['KeyL']
+    };
+    const input2 = {
+      left: keys['ArrowLeft'],
+      right: keys['ArrowRight'],
+      jump: keys['ArrowUp'],
+      shield: keys['Numpad0'] || keys['Digit0'],
+      melee: keys['Numpad1'] || keys['Digit1'],
+      ranged: keys['Numpad2'] || keys['Digit2'],
+      special: keys['Numpad3'] || keys['Digit3']
+    };
+    
+    // Update mechas
+    this.mecha1.update(input1, this.mecha2, this.particles, this.projectiles);
+    this.mecha2.update(input2, this.mecha1, this.particles, this.projectiles);
+    
+    // Update projectiles
+    for (const p of this.projectiles) {
+      if (!p.alive) continue;
+      p.update();
+      
+      // Check collision with opponent
+      const target = (p.owner === this.mecha1) ? this.mecha2 : this.mecha1;
+      const pHit = p.getHitbox();
+      const tHit = target.getHitbox();
+      
+      if (pHit.x < tHit.x + tHit.w && pHit.x + pHit.w > tHit.x &&
+          pHit.y < tHit.y + tHit.h && pHit.y + pHit.h > tHit.y) {
+        // Hit!
+        target.takeDamage(p.damage, p.owner);
+        p.alive = false;
+        
+        // Impact particles
+        const ix = pHit.x + pHit.w / 2;
+        const iy = pHit.y + pHit.h / 2;
+        for (let i = 0; i < 6; i++) {
+          this.particles.push(new Particle(
+            ix, iy,
+            (Math.random() - 0.5) * 5,
+            (Math.random() - 0.5) * 5 - 2,
+            p.color, 10, 3
+          ));
+        }
+        
+        // Screen shake on special hit
+        if (p.type === 'special') {
+          this.screenShake = Math.max(this.screenShake, 6);
+        } else {
+          this.screenShake = Math.max(this.screenShake, 2);
+        }
+      }
+    }
+    
+    // Clean up dead projectiles
+    this.projectiles = this.projectiles.filter(p => p.alive);
+    
+    // Update particles
+    this.particles = this.particles.filter(p => p.update());
+    
+    // Check win condition
+    if (this.mecha1.hp <= 0 || this.mecha2.hp <= 0) {
+      this.endRound();
+    }
+  }
+  
+  endRound() {
+    let winner = -1;
+    if (this.mecha1.hp > this.mecha2.hp) winner = 0;
+    else if (this.mecha2.hp > this.mecha1.hp) winner = 1;
+    else winner = -1; // Draw
+    
+    if (winner >= 0) {
+      this.scores[winner]++;
+    }
+    
+    this.roundEndDelay = 150; // frames
+    this.state = STATE.ROUND_END;
+    this.roundWinner = winner;
+    
+    playSfx('round_win');
+    
+    // Victory particles
+    if (winner >= 0) {
+      const victor = winner === 0 ? this.mecha1 : this.mecha2;
+      for (let i = 0; i < 30; i++) {
+        this.particles.push(new Particle(
+          victor.x + victor.width / 2,
+          victor.y + victor.height / 2,
+          (Math.random() - 0.5) * 8,
+          (Math.random() - 0.5) * 8 - 4,
+          victor.config.particleColor, 30 + Math.random() * 20, 2
+        ));
+      }
+    }
+    
+    // Game over check is handled by the game loop after roundEndDelay expires
+  }
+  
+  render() {
+    const ctx = offCtx;
+    ctx.clearRect(0, 0, INTERNAL_W, INTERNAL_H);
+    
+    // Screen shake offset
+    let shakeX = 0, shakeY = 0;
+    if (this.screenShake > 0) {
+      shakeX = (Math.random() - 0.5) * this.screenShake * 2;
+      shakeY = (Math.random() - 0.5) * this.screenShake * 2;
+    }
+    
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+    
+    this.drawBackground(ctx);
+    
+    if (this.state === STATE.TITLE) {
+      this.drawTitle(ctx);
+    } else {
+      this.drawArena(ctx);
+      
+      // Draw mechas
+      this.mecha1.draw(ctx);
+      this.mecha2.draw(ctx);
+      
+      // Draw projectiles
+      for (const p of this.projectiles) {
+        p.draw(ctx);
+      }
+      
+      // Draw particles
+      for (const p of this.particles) {
+        p.draw(ctx);
+      }
+      
+      // Draw UI
+      this.drawUI(ctx);
+      
+      // Draw overlays
+      if (this.state === STATE.ROUND_END) {
+        this.drawRoundEnd(ctx);
+      }
+      if (this.state === STATE.GAME_OVER) {
+        this.drawGameOver(ctx);
+      }
+    }
+    
+    ctx.restore();
+    
+    // Scale to display canvas
+    const displayCtx = ctx_display;
+    displayCtx.imageSmoothingEnabled = false;
+    displayCtx.clearRect(0, 0, canvas.width, canvas.height);
+    displayCtx.drawImage(offscreen, 0, 0, canvas.width, canvas.height);
+  }
+  
+  drawBackground(ctx) {
+    // Sky gradient
+    const skyGrad = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+    skyGrad.addColorStop(0, '#0a0a1a');
+    skyGrad.addColorStop(0.5, '#0d0d2a');
+    skyGrad.addColorStop(1, '#1a1040');
+    ctx.fillStyle = skyGrad;
+    ctx.fillRect(0, 0, INTERNAL_W, GROUND_Y);
+    
+    // Stars
+    for (const s of this.bgStars) {
+      const twinkle = 0.4 + Math.sin(this.titleFlash * 0.03 + s.twinkle) * 0.4;
+      ctx.fillStyle = `rgba(255,255,255,${twinkle})`;
+      ctx.fillRect(Math.floor(s.x), Math.floor(s.y), s.size, s.size);
+    }
+    
+    // Moon
+    ctx.fillStyle = '#eeddcc';
+    ctx.fillRect(520, 30, 28, 28);
+    ctx.fillStyle = '#0d0d2a';
+    ctx.fillRect(528, 26, 24, 24);
+    
+    // City skyline
+    ctx.fillStyle = '#111128';
+    this.drawBuilding(ctx, 20, GROUND_Y - 60, 40, 60);
+    this.drawBuilding(ctx, 70, GROUND_Y - 80, 30, 80);
+    this.drawBuilding(ctx, 110, GROUND_Y - 45, 35, 45);
+    this.drawBuilding(ctx, 155, GROUND_Y - 100, 25, 100);
+    this.drawBuilding(ctx, 190, GROUND_Y - 55, 40, 55);
+    this.drawBuilding(ctx, 240, GROUND_Y - 75, 30, 75);
+    this.drawBuilding(ctx, 350, GROUND_Y - 50, 35, 50);
+    this.drawBuilding(ctx, 400, GROUND_Y - 90, 40, 90);
+    this.drawBuilding(ctx, 450, GROUND_Y - 60, 30, 60);
+    this.drawBuilding(ctx, 490, GROUND_Y - 70, 35, 70);
+    this.drawBuilding(ctx, 540, GROUND_Y - 85, 40, 85);
+    this.drawBuilding(ctx, 590, GROUND_Y - 55, 40, 55);
+    
+    // Building lights (windows)
+    ctx.fillStyle = '#ffcc44';
+    for (const b of [{x:25,y:GROUND_Y-50},{x:25,y:GROUND_Y-35},{x:35,y:GROUND_Y-45},{x:35,y:GROUND_Y-30},
+      {x:115,y:GROUND_Y-30},{x:125,y:GROUND_Y-25},{x:160,y:GROUND_Y-85},{x:160,y:GROUND_Y-70},
+      {x:405,y:GROUND_Y-75},{x:415,y:GROUND_Y-60},{x:425,y:GROUND_Y-70},{x:425,y:GROUND_Y-50}]) {
+      ctx.fillRect(b.x, b.y, 4, 4);
+    }
+  }
+  
+  drawBuilding(ctx, x, y, w, h) {
+    ctx.fillRect(x, y, w, h);
+    // Antenna on tall buildings
+    if (h > 70) {
+      ctx.fillRect(x + w/2 - 1, y - 8, 2, 8);
+    }
+  }
+  
+  drawArena(ctx) {
+    // Ground
+    const groundGrad = ctx.createLinearGradient(0, GROUND_Y, 0, INTERNAL_H);
+    groundGrad.addColorStop(0, '#2a2a3a');
+    groundGrad.addColorStop(0.3, '#1a1a2a');
+    groundGrad.addColorStop(1, '#0a0a15');
+    ctx.fillStyle = groundGrad;
+    ctx.fillRect(0, GROUND_Y, INTERNAL_W, INTERNAL_H - GROUND_Y);
+    
+    // Ground line
+    ctx.fillStyle = '#3a3a5a';
+    ctx.fillRect(0, GROUND_Y, INTERNAL_W, 2);
+    
+    // Ground texture - grid pattern
+    ctx.fillStyle = '#222240';
+    for (let x = 0; x < INTERNAL_W; x += 32) {
+      for (let y = GROUND_Y + 8; y < INTERNAL_H; y += 16) {
+        ctx.fillRect(x, y, 1, 1);
+        ctx.fillRect(x + 16, y + 4, 1, 1);
+      }
+    }
+    
+    // Arena boundaries
+    ctx.strokeStyle = '#4a4a6a';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(8, 8, INTERNAL_W - 16, INTERNAL_H - 16);
+    
+    // Corner decorations
+    ctx.fillStyle = '#3a3a5a';
+    const corners = [[8,8],[INTERNAL_W-16,8],[8,INTERNAL_H-16],[INTERNAL_W-16,INTERNAL_H-16]];
+    for (const [cx, cy] of corners) {
+      ctx.fillRect(cx, cy, 6, 6);
+    }
+    
+    // Center line indicator
+    ctx.fillStyle = '#2a2a4a';
+    ctx.fillRect(INTERNAL_W/2 - 1, GROUND_Y, 2, INTERNAL_H - GROUND_Y);
+  }
+  
+  drawUI(ctx) {
+    const margin = 20;
+    
+    // P1 Health bar (left)
+    this.drawHealthBar(ctx, margin, 15, 180, 14, this.mecha1, true);
+    
+    // P2 Health bar (right)
+    this.drawHealthBar(ctx, INTERNAL_W - margin - 180, 15, 180, 14, this.mecha2, false);
+    
+    // Round indicators (center top)
+    const roundY = 12;
+    ctx.fillStyle = '#555';
+    for (let i = 0; i < 3; i++) {
+      const rx = INTERNAL_W / 2 - 18 + i * 18;
+      if (i < this.scores[0]) {
+        ctx.fillStyle = '#44aaff';
+        ctx.fillRect(rx, roundY, 10, 10);
+      } else if (i < this.scores[1]) {
+        ctx.fillStyle = '#ff4444';
+        ctx.fillRect(rx, roundY, 10, 10);
+      } else {
+        ctx.fillStyle = '#333';
+        ctx.fillRect(rx, roundY, 10, 10);
+        ctx.fillStyle = '#555';
+        ctx.fillRect(rx+1, roundY+1, 8, 8);
+      }
+    }
+    
+    // Timer
+    const secs = Math.ceil(this.roundTimer / 60);
+    const mins = Math.floor(secs / 60);
+    const displaySecs = secs % 60;
+    ctx.fillStyle = '#aaa';
+    ctx.font = '14px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    
+    const timeStr = `${mins}:${displaySecs.toString().padStart(2, '0')}`;
+    if (secs <= 10) {
+      ctx.fillStyle = '#ff4444';
+      // Blink when low
+      if (secs <= 5 && Math.floor(this.titleFlash / 30) % 2 === 0) {
+        ctx.fillStyle = '#ff0000';
+      }
+    }
+    ctx.fillText(timeStr, INTERNAL_W / 2, 38);
+    
+    // Player labels
+    ctx.fillStyle = '#44aaff';
+    ctx.font = '10px "Courier New", monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('P1 机甲·蓝', margin, 42);
+    ctx.fillStyle = '#ff6644';
+    ctx.textAlign = 'right';
+    ctx.fillText('机甲·红 P2', INTERNAL_W - margin, 42);
+    
+    // Combo display
+    if (this.mecha1.combo > 1 && this.mecha1.comboTimer > 0) {
+      ctx.fillStyle = '#ffdd00';
+      ctx.font = 'bold 16px "Courier New", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${this.mecha1.combo} COMBO!`, this.mecha1.x + this.mecha1.width/2, this.mecha1.y - 12);
+    }
+    if (this.mecha2.combo > 1 && this.mecha2.comboTimer > 0) {
+      ctx.fillStyle = '#ff8800';
+      ctx.font = 'bold 16px "Courier New", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${this.mecha2.combo} COMBO!`, this.mecha2.x + this.mecha2.width/2, this.mecha2.y - 12);
+    }
+  }
+  
+  drawHealthBar(ctx, x, y, w, h, mecha, leftAlign) {
+    // Background
+    ctx.fillStyle = '#1a1a3a';
+    ctx.fillRect(x, y, w, h);
+    
+    // HP bar
+    const hpRatio = mecha.hp / mecha.maxHp;
+    const hpW = Math.floor((w - 2) * hpRatio);
+    
+    // Gradient based on HP
+    let hpColor;
+    if (hpRatio > 0.5) {
+      hpColor = mecha.config.particleColor;
+    } else if (hpRatio > 0.25) {
+      hpColor = '#ffcc00';
+    } else {
+      hpColor = '#ff3333';
+    }
+    
+    ctx.fillStyle = hpColor;
+    if (leftAlign) {
+      ctx.fillRect(x + 1, y + 1, hpW, h - 2);
+    } else {
+      ctx.fillRect(x + w - 1 - hpW, y + 1, hpW, h - 2);
+    }
+    
+    // Energy bar (below HP bar)
+    const ey = y + h + 2;
+    const eh = 5;
+    ctx.fillStyle = '#1a1a3a';
+    ctx.fillRect(x, ey, w, eh);
+    
+    const eRatio = mecha.energy / mecha.maxEnergy;
+    const ew = Math.floor((w - 2) * eRatio);
+    
+    ctx.fillStyle = '#ffdd44';
+    if (leftAlign) {
+      ctx.fillRect(x + 1, ey + 1, ew, eh - 2);
+    } else {
+      ctx.fillRect(x + w - 1 - ew, ey + 1, ew, eh - 2);
+    }
+    
+    // HP text
+    ctx.fillStyle = '#fff';
+    ctx.font = '9px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`HP ${mecha.hp}/${mecha.maxHp}`, x + w/2, y + 11);
+  }
+  
+  drawTitle(ctx) {
+    // Title background - darker overlay
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(0, 0, INTERNAL_W, INTERNAL_H);
+    
+    // Draw both mechas posing (identical size, different colors)
+    const m1 = new Mecha(130, GROUND_Y - 50, true, MECHA_CONFIGS.striker);
+    const m2 = new Mecha(INTERNAL_W - 164, GROUND_Y - 50, false, MECHA_CONFIGS.juggernaut);
+    m1.draw(ctx);
+    m2.draw(ctx);
+    
+    // VS text
+    const vsAlpha = 0.6 + Math.sin(this.titleFlash * 0.05) * 0.3;
+    ctx.fillStyle = `rgba(255,255,100,${vsAlpha})`;
+    ctx.font = 'bold 36px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('VS', INTERNAL_W / 2, GROUND_Y - 20);
+    
+    // Title
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 28px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('像素机甲大战', INTERNAL_W / 2, 80);
+    
+    ctx.fillStyle = '#4488cc';
+    ctx.font = '14px "Courier New", monospace';
+    ctx.fillText('PIXEL MECHA BATTLE', INTERNAL_W / 2, 102);
+    
+    // Controls display
+    const ctrlY = 125;
+    ctx.fillStyle = '#888';
+    ctx.font = '10px "Courier New", monospace';
+    
+    // P1 controls
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#44aaff';
+    ctx.fillText('P1 机甲·蓝', 60, ctrlY);
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('移动: W A S D', 60, ctrlY + 16);
+    ctx.fillText('近战: J    远程: K', 60, ctrlY + 32);
+    ctx.fillText('大招: L    防御: I', 60, ctrlY + 48);
+    
+    // P2 controls
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#ff6644';
+    ctx.fillText('机甲·红 P2', INTERNAL_W - 60, ctrlY);
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('移动: 方向键', INTERNAL_W - 60, ctrlY + 16);
+    ctx.fillText('近战: 1    远程: 2', INTERNAL_W - 60, ctrlY + 32);
+    ctx.fillText('大招: 3    防御: 0', INTERNAL_W - 60, ctrlY + 48);
+    
+    // Start prompt
+    const blinkAlpha = Math.floor(this.titleFlash / 40) % 2 === 0 ? 1 : 0.3;
+    ctx.fillStyle = `rgba(255,255,100,${blinkAlpha})`;
+    ctx.font = 'bold 16px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('按 空格键 开始对战', INTERNAL_W / 2, 290);
+    
+    // Bottom info
+    ctx.fillStyle = '#666';
+    ctx.font = '9px "Courier New", monospace';
+    ctx.fillText('三局两胜 | 先得两分者获胜', INTERNAL_W / 2, 320);
+    ctx.fillText('能量条满可使用大招 | 防御键可格挡伤害', INTERNAL_W / 2, 338);
+  }
+  
+  drawRoundEnd(ctx) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, INTERNAL_H / 2 - 40, INTERNAL_W, 80);
+    
+    let text, color;
+    if (this.roundWinner >= 0) {
+      const winner = this.roundWinner === 0 ? 'P1 机甲·蓝' : 'P2 机甲·红';
+      color = this.roundWinner === 0 ? '#44aaff' : '#ff6644';
+      text = `${winner} 获胜!`;
+    } else {
+      text = '平局!';
+      color = '#ffcc00';
+    }
+    
+    ctx.fillStyle = color;
+    ctx.font = 'bold 22px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(text, INTERNAL_W / 2, INTERNAL_H / 2 + 5);
+    
+    // Score
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px "Courier New", monospace';
+    ctx.fillText(`${this.scores[0]} - ${this.scores[1]}`, INTERNAL_W / 2, INTERNAL_H / 2 + 28);
+  }
+  
+  drawGameOver(ctx) {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, INTERNAL_W, INTERNAL_H);
+    
+    const winner = this.gameWinner === 0 ? 'P1 机甲·蓝' : 'P2 机甲·红';
+    const color = this.gameWinner === 0 ? '#44aaff' : '#ff6644';
+    const mechaName = this.gameWinner === 0 ? '机甲·蓝 MECHA BLUE' : '机甲·红 MECHA RED';
+    
+    ctx.fillStyle = '#ffdd00';
+    ctx.font = 'bold 12px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', INTERNAL_W / 2, INTERNAL_H / 2 - 60);
+    
+    ctx.fillStyle = color;
+    ctx.font = 'bold 28px "Courier New", monospace';
+    ctx.fillText(`${winner} 赢得比赛!`, INTERNAL_W / 2, INTERNAL_H / 2 - 20);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px "Courier New", monospace';
+    ctx.fillText(mechaName, INTERNAL_W / 2, INTERNAL_H / 2 + 10);
+    
+    ctx.fillStyle = '#aaa';
+    ctx.font = '12px "Courier New", monospace';
+    ctx.fillText(`最终比分: ${this.scores[0]} - ${this.scores[1]}`, INTERNAL_W / 2, INTERNAL_H / 2 + 40);
+    
+    const blinkAlpha = Math.floor(this.titleFlash / 40) % 2 === 0 ? 1 : 0.3;
+    ctx.fillStyle = `rgba(255,255,100,${blinkAlpha})`;
+    ctx.font = 'bold 14px "Courier New", monospace';
+    ctx.fillText('按 空格键 重新开始', INTERNAL_W / 2, INTERNAL_H / 2 + 75);
+  }
+}
+
+// ============================================================
+//  MAIN GAME LOOP
+// ============================================================
+const ctx_display = ctx; // Store reference to display context
+
+const game = new Game();
+
+function gameLoop() {
+  // Handle title/restart
+  if (game.state === STATE.TITLE && keys['Space']) {
+    keys['Space'] = false;
+    game.scores = [0, 0];
+    game.round = 0;
+    game.startRound();
+  }
+  
+  if (game.state === STATE.GAME_OVER && keys['Space']) {
+    keys['Space'] = false;
+    game.scores = [0, 0];
+    game.round = 0;
+    game.state = STATE.TITLE;
+  }
+  
+  // Round end delay
+  if (game.state === STATE.ROUND_END) {
+    game.roundEndDelay--;
+    if (game.roundEndDelay <= 0) {
+      // Check if game is over (best of 3)
+      if (game.scores[0] >= 2 || game.scores[1] >= 2) {
+        game.state = STATE.GAME_OVER;
+        game.gameWinner = game.scores[0] >= 2 ? 0 : 1;
+        playSfx('game_over');
+      } else {
+        game.startRound();
+      }
+    }
+  }
+  
+  game.update();
+  game.render();
+  
+  requestAnimationFrame(gameLoop);
+}
+
+// Start
+gameLoop();
+console.log('🚀 像素机甲大战 - Pixel Mecha Battle 已就绪!');
+console.log('双方属性完全一致，公平对战！');
+console.log('P1 机甲·蓝: WASD移动 J近战 K远程 L大招 I防御');
+console.log('P2 机甲·红: 方向键移动 1近战 2远程 3大招 0防御');
+console.log('按空格键开始对战!');
+</script>
+</body>
+</html>
